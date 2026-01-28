@@ -1,0 +1,153 @@
+% T1 * Mask normalized by T1
+% Load data
+
+nii_t1 = double(niftiread('data/anonymous_34_vessel/0 Anonymous_34(3).nii.gz'));
+nii_mask = niftiread('data/anonymous_34_vessel/Anonymous_34_seg.nii.gz');
+nii_vessel = niftiread("data/anonymous_34_vessel/Vessel_34_seg.nii.gz")
+
+%% ===============================
+%  Vessel wall surface SI mapping
+%  FIXED: coordinate convention (isosurface x/y vs interpolant)
+%% ===============================
+
+% Load data
+% nii_t1   = double(niftiread('IA_103_A1/IA_103_A1_T1.nii.gz'));
+% nii_t1gd = double(niftiread('IA_103_A1/IA_103_A1_T1Gd.nii.gz')); %#ok<NASGU>
+% nii_mask = niftiread('IA_103_A1/IA_103_A1_pred.nii.gz');
+
+nii_mask = nii_mask > 0;
+nii_vessel = nii_vessel > 0;
+
+%% Masked T1
+masked_img = nii_t1 .* double(nii_mask);
+
+%% Lumen removal (safe, only inside mask)
+masked_vals = masked_img(nii_mask > 0);
+lumen_threshold = 0.3 * max(masked_vals);
+
+lumen_mask = false(size(nii_mask));
+lumen_mask(nii_mask > 0) = masked_vals < lumen_threshold;
+
+wall_mask = nii_mask & ~lumen_mask;
+
+%% Surface from wall
+fv = isosurface(nii_mask, 0.5);
+fv = smoothpatch(fv, 1, 10);
+
+fv_vessel = isosurface(nii_vessel, 0.5);
+% 可选：轻微平滑（建议）
+fv_vessel = smoothpatch(fv_vessel, 1, 10);
+
+%% Normalize using wall only
+wall_vals = nii_t1(wall_mask > 0);
+t1_min = prctile(wall_vals, 2);
+t1_max = prctile(wall_vals, 98);
+
+nii_t1_norm = zeros(size(nii_t1));
+nii_t1_norm(wall_mask > 0) = (nii_t1(wall_mask > 0) - t1_min) / (t1_max - t1_min);
+nii_t1_norm = min(max(nii_t1_norm, 0), 1);
+
+%% -------------------------------
+% IMPORTANT FIX: use meshgrid so that
+% interpolant coordinates match isosurface vertices (x=col, y=row, z=slice)
+%% -------------------------------
+nR = size(nii_t1_norm,1);
+nC = size(nii_t1_norm,2);
+nZ = size(nii_t1_norm,3);
+
+[nR, nC, nZ] = size(nii_t1_norm);
+[Y, X, Z] = ndgrid(1:nR, 1:nC, 1:nZ);   % 注意顺序：Y=row, X=col
+
+interpFunc = griddedInterpolant(Y, X, Z, nii_t1_norm, ...
+    'linear', 'nearest');
+
+wall_dil = imdilate(wall_mask, strel('sphere', 1));
+interpWall = griddedInterpolant(Y, X, Z, double(wall_dil), ...
+    'nearest', 'nearest');
+
+%% Normals (stable via distance field)
+dist = bwdist(~wall_mask);
+normals = isonormals(dist, fv.vertices);
+
+%% Sampling params
+max_d = 1.0;
+step  = 0.25;
+
+max_sis = nan(size(fv.vertices,1),1);
+empty_cnt = 0;
+
+%% Sample along normals
+for i = 1:size(fv.vertices,1)
+    vtx = fv.vertices(i,:);   % (x,y,z) = (col,row,slice)
+    n = normals(i,:);
+    n = n / (norm(n) + eps);
+
+    sis = [];
+
+    for t = -max_d : step : max_d
+        p = vtx + t*n;  % still (x,y,z)
+
+        % bounds check in (x,y,z)
+        if p(1) < 1 || p(1) > nC || p(2) < 1 || p(2) > nR || p(3) < 1 || p(3) > nZ
+            continue;
+        end
+
+        % keep only near wall
+        % 正确
+        if interpWall(p(2),p(1),p(3)) < 0.5
+            continue;
+        end
+
+        % 正确
+        val = interpFunc(p(2),p(1),p(3));
+        
+        if val <= 0
+            continue;
+        end
+        sis(end+1) = val; %#ok<SAGROW>
+    end
+
+    if isempty(sis)
+        empty_cnt = empty_cnt + 1;
+        max_sis(i) = nan;
+    else
+        max_sis(i) = prctile(sis, 90);  % robust
+    end
+
+    if i == 100
+    fprintf('sample value = %.3f\n', interpFunc(p(2),p(1),p(3)));
+    end
+end
+
+vals = max_sis(~isnan(max_sis));
+fprintf('empty vertices: %.2f%%\n', 100*empty_cnt/numel(max_sis));
+fprintf('max_sis stats: min=%.3f mean=%.3f max=%.3f std=%.3f\n', ...
+    min(vals), mean(vals), max(vals), std(vals));
+
+[min(max_sis), mean(max_sis), max(max_sis), std(max_sis)]
+%% Visualize (adaptive clim)
+figure;
+trisurf(fv.faces, fv.vertices(:,1), fv.vertices(:,2), fv.vertices(:,3), ...
+    max_sis, 'FaceColor','interp','EdgeColor','none');
+colormap parula; colorbar;
+
+hold on;
+
+p_vessel = patch( ...
+    'Faces', fv_vessel.faces, ...
+    'Vertices', fv_vessel.vertices, ...
+    'FaceColor', [0.8 0.8 0.8], ...   % 灰色（不参与 colormap）
+    'EdgeColor', 'none', ...
+    'FaceAlpha', 0.2 );               % 半透明
+
+if ~isempty(vals)
+    c1 = prctile(vals, 5);
+    c2 = prctile(vals, 95);
+    if c2 <= c1, c1 = min(vals); c2 = max(vals); end
+    clim([c1 c2]);
+else
+    clim([0 1]);
+end
+
+axis off; view(3);
+lighting gouraud; camlight headlight; material dull;
